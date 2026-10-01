@@ -88,6 +88,30 @@ def _existing_version(db: Any, plugin, version: str):
     ).scalar_one_or_none()
 
 
+def get_version_row(db: Any, plugin_name: str, version: str):
+    """按插件名+版本号读取版本行（含已撤销版本）；不存在返回 None。"""
+    o = _orm()
+    return db.execute(
+        o.select(o.PluginVersion)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.Plugin.name == plugin_name, o.PluginVersion.version == version)
+    ).scalar_one_or_none()
+
+
+def versions_sharing_sha(db: Any, sha256: str) -> list:
+    """共享同一 SHA-256 的全部版本行（跨插件、含已撤销版本）。
+
+    内容寻址存储中同摘要即同物理文件，修复一个文件即恢复所有这些版本。
+    """
+    o = _orm()
+    return list(db.execute(
+        o.select(o.PluginVersion, o.Plugin.name)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.PluginVersion.sha256 == sha256.lower())
+        .order_by(o.Plugin.name, o.PluginVersion.version)
+    ).all())
+
+
 def _insert_version(db: Any, *, plugin, metadata, sha256: str,
                     original_filename: str, storage_path: str, size: int,
                     revision_no: int):

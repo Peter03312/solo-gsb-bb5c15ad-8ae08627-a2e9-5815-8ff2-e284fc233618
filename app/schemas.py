@@ -249,3 +249,49 @@ class BatchOut(BaseModel):
 class OkOut(BaseModel):
     ok: bool = True
     message: str
+
+
+# ----------------------------------------------------------- 安装包核验与修复
+
+class SharedVersionOut(BaseModel):
+    """共享同一 SHA-256（即同一物理包文件）的一个已发布版本。"""
+    plugin: str
+    version: str
+    package_url: str
+    revoked: bool = False
+
+
+class PackageVerifyOut(BaseModel):
+    """单个已发布版本安装包的核验结果（读接口，始终开放，含已撤销版本）。"""
+    plugin: str
+    version: str
+    sha256: str
+    # intact 完好 / missing 缺失 / corrupt 损坏
+    state: str
+    message: str
+    actual_sha256: str | None = None
+    size_bytes: int | None = None
+    revoked: bool = False
+    package_url: str
+    shared_versions: int = 0
+    shared_version_list: list[SharedVersionOut] = Field(default_factory=list)
+
+
+class PackageRepairOut(BaseModel):
+    """安装包修复结果：不产生目录修订、不改任何版本元数据。
+
+    repaired=true 表示本次真正完成原子替换；false 表示文件原本就完好，
+    未做任何改写。shared_versions 为随该文件一并恢复可下载的版本总数
+    （含被修复版本本身、跨插件、含已撤销版本）。
+    """
+    plugin: str
+    version: str
+    sha256: str
+    # repaired 本次已修复 / no_repair_needed 原本完好无需修复
+    state: str
+    repaired: bool
+    message: str
+    affected_versions: int
+    shared_versions: int
+    shared_version_list: list[SharedVersionOut] = Field(default_factory=list)
+    package_url: str

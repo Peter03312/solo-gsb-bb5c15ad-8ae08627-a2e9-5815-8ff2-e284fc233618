@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -102,6 +103,43 @@ class Client:
     def batch(self, batch_id: str):
         return self._request("GET", f"/batches/{batch_id}")
 
+    # ------------------------------------------------------------ 核验与修复
+    def verify(self, plugin: str, version: str):
+        """核验安装包：intact/missing/corrupt + 共享该摘要的版本数（读接口）。"""
+        return self._request(
+            "GET", f"/plugins/{plugin}/versions/{version}/verify")
+
+    def repair(self, plugin: str, version: str, payload: bytes):
+        """提交同摘要替换包修复缺失/损坏文件（写接口；multipart 单文件）。"""
+        boundary = "----labrepair" + uuid.uuid4().hex
+        buf = io.BytesIO()
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(
+            b'Content-Disposition: form-data; name="package"; '
+            b'filename="package.bin"\r\n')
+        buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
+        buf.write(payload)
+        buf.write(f"\r\n--{boundary}--\r\n".encode())
+        return self._request(
+            "POST", f"/plugins/{plugin}/versions/{version}/repair",
+            data=buf.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def download_raw(self, plugin: str, version: str):
+        """下载原始安装包字节；返回 (status, headers, bytes|payload)。"""
+        url = f"{self.base}/plugins/{plugin}/versions/{version}/download"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = raw.decode("utf-8", "replace")
+            return e.code, dict(e.headers), payload
+
     def solve(self, req: dict):
         return self._request("POST", "/solutions", data=req)
 
@@ -130,6 +168,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost:8080")
     ap.add_argument("--token", default=None)
+    ap.add_argument(
+        "--package-dir", default=None,
+        help="服务器 PACKAGE_DIR 在本机的路径（给出后追加“损坏→修复”运维演练）")
     args = ap.parse_args()
     c = Client(args.base, args.token)
 
@@ -307,6 +348,69 @@ def main() -> int:
     st, _, berr = c.publish_batch("batch-demo-dup", [b_lib, b_lib])
     show("批次内重复成员（409）", st, berr)
     assert st == 409
+
+    # ------------------------------------------------------------ 安装包核验与修复
+    # 两个不同插件版本发布完全相同的包字节 -> 共享同一 SHA-256 与同一物理文件
+    same = b"same-bytes-for-two-versions"
+    same_sha = hashlib.sha256(same).hexdigest()
+    meta_s1 = {"plugin": "repair-a", "version": "1.0.0", "sha256": same_sha,
+               "runtimes": [], "dependencies": [], "conflicts": []}
+    meta_s2 = {"plugin": "repair-b", "version": "1.0.0", "sha256": same_sha,
+               "runtimes": [], "dependencies": [], "conflicts": []}
+    st, _, _ = c.publish(meta_s1, same)
+    assert st == 201, st
+    st, _, _ = c.publish(meta_s2, same)
+    assert st == 201, st
+
+    st, _, v = c.verify("repair-a", "1.0.0")
+    show("核验完好包（state=intact，shared=2）", st, {
+        "state": v["state"], "sha256": v["sha256"],
+        "shared_versions": v["shared_versions"],
+        "shared": [(s["plugin"], s["version"]) for s in v["shared_version_list"]]})
+    assert st == 200 and v["state"] == "intact" and v["shared_versions"] == 2
+
+    # 对完好包再次提交修复 -> no_repair_needed，服务端不改写文件
+    st, _, rr = c.repair("repair-a", "1.0.0", same)
+    show("完好包修复（no_repair_needed，repaired=false）", st, {
+        "state": rr["state"], "repaired": rr["repaired"]})
+    assert st == 200 and rr["repaired"] is False
+
+    # 摘要不符的替换文件 -> 422 明确拒绝，原文件保留
+    st, _, bad = c.repair("repair-a", "1.0.0", b"totally-wrong-bytes")
+    show("修复摘要不符（422 repair_sha_mismatch）", st,
+         bad["detail"] if isinstance(bad, dict) else bad)
+    assert st == 422 and bad["detail"]["code"] == "repair_sha_mismatch"
+
+    # 未知版本核验/修复 -> 404
+    assert c.verify("ghost-x", "1.0.0")[0] == 404
+    assert c.repair("ghost-x", "1.0.0", same)[0] == 404
+
+    # 磁盘损坏的模拟只能在服务主机上直接改文件；通过 --package-dir 指到
+    # 服务器 PACKAGE_DIR（如 compose 的命名卷挂载点）可跑完整离线运维演练：
+    #   1) 破坏 <dir>/<sha前两位>/<sha>；2) verify -> corrupt 且下载 404；
+    #   3) repair 提交原包 -> repaired，affected_versions=2，两个版本恢复下载。
+    if args.package_dir:
+        target = os.path.join(args.package_dir, same_sha[:2], same_sha)
+        with open(target, "wb") as f:
+            f.write(b"corrupted-bytes")
+        st, _, v = c.verify("repair-a", "1.0.0")
+        show("模拟损坏后核验（state=corrupt）", st,
+             {"state": v["state"], "actual": v["actual_sha256"]})
+        assert v["state"] == "corrupt"
+        st, hdrs, dl = c.download_raw("repair-a", "1.0.0")
+        show("损坏包下载被拒（404，绝不返回坏内容）", st, dl)
+        assert st == 404
+        st, _, rr = c.repair("repair-a", "1.0.0", same)
+        show("修复（repaired，affected_versions=2）", st, {
+            "state": rr["state"], "affected_versions": rr["affected_versions"]})
+        assert st == 200 and rr["repaired"] is True
+        assert rr["affected_versions"] == 2
+        # 同摘要另一版本随之恢复可下载
+        st, _h, dl = c.download_raw("repair-b", "1.0.0")
+        show("同摘要版本恢复下载", st, {"bytes": len(dl), "ok": dl == same})
+        assert st == 200 and dl == same
+        # 目录修订不增加：修复前后 /revisions 最新修订一致
+        print("（修复不产生目录修订、不改版本元数据）")
 
     print("\n全部示例断言通过。")
     return 0

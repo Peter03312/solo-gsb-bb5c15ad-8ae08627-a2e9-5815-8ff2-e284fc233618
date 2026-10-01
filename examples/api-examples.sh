@@ -214,4 +214,61 @@ curl -sS -X POST "${AUTH[@]}" \
   -F "package=@${PARTS[0]%%|*};filename=pack-b-1.0.0.bin" \
   "$API/batches" | python3 -m json.tool || true
 
+# 16) 安装包核验：按已发布插件名+版本返回记录摘要、完好/缺失/损坏与同摘要版本数
+echo ">>> 核验 pack-a==1.0.0（读接口，无需 token；已撤销版本也可核验）"
+curl -fsS "$API/plugins/pack-a/versions/1.0.0/verify" | python3 -m json.tool
+
+# 17) 损坏/缺失演练：在包存储卷里破坏文件 -> 核验 corrupt、下载被拒 ->
+#     提交同摘要文件原子修复 -> 同摘要版本一并恢复（不产生目录修订）
+#     本机直跑（PACKAGE_DIR 可直接访问）时设 PKG_DIR 环境变量指向它；
+#     docker compose 部署时脚本自动进入 api 容器的 /data/packages 操作。
+SHA_A="$(python3 -c 'import json;print(json.load(open("'$batch_dir'/meta-1.json"))["sha256"])')"
+REV_BEFORE="$(curl -fsS "$API/revisions" | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["revision"])')"
+
+if [[ -n "${PKG_DIR:-}" && -d "${PKG_DIR}/${SHA_A:0:2}" ]]; then
+  echo ">>> 破坏安装包（本机 PACKAGE_DIR=$PKG_DIR）"
+  printf 'corrupted' > "$PKG_DIR/${SHA_A:0:2}/$SHA_A"
+elif docker compose exec -T api sh -c 'test -d /data/packages' 2>/dev/null; then
+  echo ">>> 破坏安装包（api 容器 /data/packages）"
+  docker compose exec -T api sh -c "printf 'corrupted' > /data/packages/${SHA_A:0:2}/$SHA_A"
+else
+  echo ">>> 跳过损坏演练：未设置 PKG_DIR 且未发现运行中的 compose api 容器"
+  echo "    手动演练：破坏 <PACKAGE_DIR>/${SHA_A:0:2}/$SHA_A 后执行下面的核验/修复步骤"
+fi
+
+echo ">>> 核验损坏包（应 state=corrupt）"
+curl -fsS "$API/plugins/pack-a/versions/1.0.0/verify" \
+  | python3 -c 'import json,sys;j=json.load(sys.stdin);
+print("state:",j["state"],"recorded:",j["sha256"][:12],"actual:",(j["actual_sha256"] or "")[:12],
+      "shared_versions:",j["shared_versions"])'
+
+echo ">>> 下载损坏包（应 404 package_corrupt，绝不返回坏内容）"
+curl -sS -D - -o /dev/null "$API/plugins/pack-a/versions/1.0.0/download" \
+  | grep -Ei 'HTTP' || true
+
+echo ">>> 修复：提交与原记录摘要一致的替换包（写接口，需要 API_TOKEN 时自动带）"
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "package=@${PARTS[0]%%|*};filename=pack-a-1.0.0.bin" \
+  "$API/plugins/pack-a/versions/1.0.0/repair" | python3 -m json.tool
+
+echo ">>> 对完好包重复修复（应 state=no_repair_needed，文件不改写）"
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "package=@${PARTS[0]%%|*};filename=pack-a-1.0.0.bin" \
+  "$API/plugins/pack-a/versions/1.0.0/repair" \
+  | python3 -c 'import json,sys;j=json.load(sys.stdin);
+print("state:",j["state"],"repaired:",j["repaired"])'
+
+echo ">>> 摘要不符的替换文件必须 422 拒绝（原文件保留）"
+printf 'wrong-bytes' > "$tmpdir/wrong.bin"
+curl -sS -X POST "${AUTH[@]}" -F "package=@$tmpdir/wrong.bin" \
+  "$API/plugins/pack-a/versions/1.0.0/repair" | python3 -m json.tool || true
+
+echo ">>> 修复后下载恢复（X-SHA256 与原记录一致，X-Revoked 保持兼容）"
+curl -fsS -D - -o "$tmpdir/restored.bin" \
+  "$API/plugins/pack-a/versions/1.0.0/download" | grep -Ei 'HTTP|x-sha256|x-revoked'
+echo "本地校验：$(sha256_file "$tmpdir/restored.bin")"
+
+REV_AFTER="$(curl -fsS "$API/revisions" | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["revision"])')"
+echo ">>> 修复不产生目录修订：修复前后最新修订均为 $REV_AFTER（$REV_BEFORE）"
+
 echo "全部示例执行完成。"

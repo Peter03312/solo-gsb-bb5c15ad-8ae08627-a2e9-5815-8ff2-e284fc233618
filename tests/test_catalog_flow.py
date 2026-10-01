@@ -431,6 +431,130 @@ class MemoryFlowTests(unittest.TestCase):
         self.assertEqual(self.db.revisions, [])
         self.assertNotIn("badsha", self.db.batches)
 
+    # ------------------------------------------------------------ 核验与修复
+    def test_inspect_missing_corrupt_intact(self):
+        fd, p = tempfile.mkstemp(dir=self.pkgdir)
+        os.close(fd)
+        os.unlink(p)
+        state, size, actual = catalog.inspect_package_file(p, "0" * 64)
+        self.assertEqual((state, size, actual),
+                         (catalog.STATE_MISSING, None, None))
+
+        fd, p2 = tempfile.mkstemp(dir=self.pkgdir)
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"good")
+        sha = hashlib.sha256(b"good").hexdigest()
+        self.assertEqual(catalog.inspect_package_file(p2, sha)[0],
+                         catalog.STATE_INTACT)
+        with open(p2, "wb") as f:
+            f.write(b"tampered")
+        state, size, actual = catalog.inspect_package_file(p2, sha)
+        self.assertEqual(state, catalog.STATE_CORRUPT)
+        self.assertEqual(size, len(b"tampered"))
+        self.assertEqual(actual, hashlib.sha256(b"tampered").hexdigest())
+
+    def test_atomic_repair_restores_missing_and_corrupt(self):
+        content = b"repair-me"
+        sha = hashlib.sha256(content).hexdigest()
+        final = catalog.content_addressed_path(self.pkgdir, sha)
+
+        # 缺失 -> 替换
+        fd, src = tempfile.mkstemp(dir=self.pkgdir)
+        os.close(fd)
+        with open(src, "wb") as f:
+            f.write(content)
+        _path, state, replaced = catalog.atomic_repair_file(src, sha, self.pkgdir)
+        self.assertTrue(replaced)
+        self.assertEqual(state, catalog.STATE_INTACT)
+        self.assertTrue(os.path.exists(final))
+        self.assertEqual(open(final, "rb").read(), content)
+
+        # 再次修复完好文件 -> 不改写
+        fd, src2 = tempfile.mkstemp(dir=self.pkgdir)
+        os.close(fd)
+        with open(src2, "wb") as f:
+            f.write(content)
+        _path, state, replaced = catalog.atomic_repair_file(src2, sha, self.pkgdir)
+        self.assertFalse(replaced)
+        self.assertEqual(state, catalog.STATE_INTACT)
+        # 未消费的源文件仍在（调用方清理）
+        self.assertTrue(os.path.exists(src2))
+        os.unlink(src2)
+
+        # 损坏 -> 原子替换恢复
+        with open(final, "wb") as f:
+            f.write(b"broken")
+        fd, src3 = tempfile.mkstemp(dir=self.pkgdir)
+        os.close(fd)
+        with open(src3, "wb") as f:
+            f.write(content)
+        _path, state, replaced = catalog.atomic_repair_file(src3, sha, self.pkgdir)
+        self.assertTrue(replaced)
+        self.assertEqual(state, catalog.STATE_INTACT)
+        self.assertEqual(open(final, "rb").read(), content)
+
+    def test_repair_preserves_content_addressed_layout_and_no_lock_garbage(self):
+        content = b"layout"
+        sha = hashlib.sha256(content).hexdigest()
+        fd, src = tempfile.mkstemp(dir=self.pkgdir)
+        os.close(fd)
+        with open(src, "wb") as f:
+            f.write(content)
+        final, _s, _r = catalog.atomic_repair_file(src, sha, self.pkgdir)
+        self.assertEqual(final, os.path.join(self.pkgdir, sha[:2], sha))
+        # 修复后无临时文件残留；锁文件位于隐藏目录不污染内容寻址视图
+        bucket = os.path.join(self.pkgdir, sha[:2])
+        names = [n for n in os.listdir(bucket) if not n.startswith(".")]
+        self.assertEqual(names, [sha])
+
+    def test_repair_rejects_wrong_digest_without_touching_original(self):
+        # 现存损坏文件 + 摘要不符的替换文件：verify 阶段拒绝，原文件原样保留
+        content = b"original-recorded"
+        sha = hashlib.sha256(content).hexdigest()
+        final = catalog.content_addressed_path(self.pkgdir, sha)
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        with open(final, "wb") as f:
+            f.write(b"still-corrupt")
+        fd, wrong = tempfile.mkstemp(dir=self.pkgdir)
+        os.close(fd)
+        with open(wrong, "wb") as f:
+            f.write(b"wrong-digest-content")
+        with self.assertRaises(catalog.PublishError):
+            catalog.verify_sha256(wrong, sha)
+        # 原损坏文件未被动过
+        self.assertEqual(open(final, "rb").read(), b"still-corrupt")
+
+    def test_concurrent_repair_only_one_replaces(self):
+        import threading
+        content = b"concurrent-bytes" * 1000
+        sha = hashlib.sha256(content).hexdigest()
+        outcomes = []
+        barrier = threading.Barrier(6)
+
+        def worker(i):
+            fd, src = tempfile.mkstemp(dir=self.pkgdir)
+            os.close(fd)
+            with open(src, "wb") as f:
+                f.write(content)
+            barrier.wait()
+            try:
+                _p, _s, replaced = catalog.atomic_repair_file(
+                    src, sha, self.pkgdir)
+                outcomes.append(replaced)
+            finally:
+                if os.path.exists(src):
+                    os.unlink(src)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertEqual(len(outcomes), 6)
+        self.assertEqual(sum(1 for r in outcomes if r), 1)
+        final = catalog.content_addressed_path(self.pkgdir, sha)
+        self.assertEqual(open(final, "rb").read(), content)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

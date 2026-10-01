@@ -53,7 +53,7 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         # 每个用例一个全新的内存库与独立包目录，避免插件名/修订号/包文件跨用例影响
         from fastapi.testclient import TestClient
-        from sqlalchemy import create_engine
+        from sqlalchemy import create_engine, event
         from sqlalchemy.pool import StaticPool
 
         from app import database
@@ -803,6 +803,296 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/revisions").json()[0]["revision"], 3)
         d = self.client.get("/api/v1/plugins/mix/versions/1.0.0/download")
         self.assertEqual(d.content, b"mix")
+
+    # ----------------------------------------------------------- 安装包核验与修复
+    def _pv_path(self, sha):
+        return os.path.join(self.pkgdir, sha[:2], sha)
+
+    def _repair(self, plugin, version, body, token=None, expect=None):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        r = self.client.post(
+            f"/api/v1/plugins/{plugin}/versions/{version}/repair",
+            files={"package": ("r.bin", io.BytesIO(body),
+                               "application/octet-stream")},
+            headers=headers)
+        if expect is not None:
+            self.assertEqual(r.status_code, expect, r.text)
+        return r
+
+    def test_verify_intact_missing_corrupt(self):
+        body = b"verify-me"
+        sha = hashlib.sha256(body).hexdigest()
+        self.publish("vf", "1.0.0", body, expect=201)
+
+        r = self.client.get("/api/v1/plugins/vf/versions/1.0.0/verify")
+        self.assertEqual(r.status_code, 200, r.text)
+        j = r.json()
+        self.assertEqual(j["state"], "intact")
+        self.assertEqual(j["sha256"], sha)
+        self.assertEqual(j["size_bytes"], len(body))
+        self.assertEqual(j["actual_sha256"], sha)
+        self.assertEqual(j["shared_versions"], 1)
+        self.assertEqual(j["shared_version_list"][0]["plugin"], "vf")
+        self.assertFalse(j["revoked"])
+        self.assertTrue(j["package_url"].endswith("/download"))
+
+        os.unlink(self._pv_path(sha))
+        j = self.client.get("/api/v1/plugins/vf/versions/1.0.0/verify").json()
+        self.assertEqual(j["state"], "missing")
+        self.assertIsNone(j["size_bytes"])
+
+        with open(self._pv_path(sha), "wb") as f:
+            f.write(b"tampered bytes")
+        j = self.client.get("/api/v1/plugins/vf/versions/1.0.0/verify").json()
+        self.assertEqual(j["state"], "corrupt")
+        self.assertEqual(j["actual_sha256"],
+                         hashlib.sha256(b"tampered bytes").hexdigest())
+
+    def test_verify_unknown_version_404(self):
+        r = self.client.get("/api/v1/plugins/ghost/versions/1.0.0/verify")
+        self.assertEqual(r.status_code, 404)
+
+    def test_repair_missing_and_corrupt_then_download_ok(self):
+        body = b"repair-content"
+        sha = hashlib.sha256(body).hexdigest()
+        self.publish("rp", "1.0.0", body, expect=201)
+        path = self._pv_path(sha)
+
+        # 缺失 -> 修复
+        os.unlink(path)
+        self.assertEqual(
+            self.client.get("/api/v1/plugins/rp/versions/1.0.0/download").status_code,
+            404)
+        rev_before = self.client.get("/api/v1/revisions").json()[0]["revision"]
+        r = self._repair("rp", "1.0.0", body, expect=200)
+        j = r.json()
+        self.assertEqual(j["state"], "repaired")
+        self.assertTrue(j["repaired"])
+        self.assertEqual(j["affected_versions"], 1)
+        # 修复不产生目录修订
+        self.assertEqual(self.client.get("/api/v1/revisions").json()[0]["revision"],
+                         rev_before)
+        d = self.client.get("/api/v1/plugins/rp/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.content, body)
+        self.assertEqual(d.headers["x-sha256"], sha)
+        self.assertEqual(d.headers["x-revoked"], "false")
+
+        # 完好再修复 -> 不改写
+        r = self._repair("rp", "1.0.0", body, expect=200)
+        self.assertEqual(r.json()["state"], "no_repair_needed")
+        self.assertFalse(r.json()["repaired"])
+
+        # 损坏 -> 修复后下载恢复，头兼容
+        with open(path, "wb") as f:
+            f.write(b"broken")
+        self.assertEqual(
+            self.client.get("/api/v1/plugins/rp/versions/1.0.0/download").status_code,
+            404)
+        r = self._repair("rp", "1.0.0", body, expect=200)
+        self.assertEqual(r.json()["state"], "repaired")
+        d = self.client.get("/api/v1/plugins/rp/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.content, body)
+
+    def test_repair_sha_mismatch_rejected_keeps_original(self):
+        body = b"original-package"
+        sha = hashlib.sha256(body).hexdigest()
+        self.publish("rm", "1.0.0", body, expect=201)
+        path = self._pv_path(sha)
+        with open(path, "wb") as f:  # 现存损坏文件
+            f.write(b"corrupt-original")
+        r = self._repair("rm", "1.0.0", b"different-bytes", expect=422)
+        self.assertEqual(r.json()["detail"]["code"], "repair_sha_mismatch")
+        # 原损坏文件原样保留，未被替换
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"corrupt-original")
+        # 仍不可下载
+        self.assertEqual(
+            self.client.get("/api/v1/plugins/rm/versions/1.0.0/download").status_code,
+            404)
+
+    def test_repair_unknown_version_404(self):
+        r = self._repair("ghost", "1.0.0", b"x")
+        self.assertEqual(r.status_code, 404)
+
+    def test_repair_shared_sha_restores_all_versions(self):
+        body = b"identical-bytes"
+        sha = hashlib.sha256(body).hexdigest()
+        self.publish("sa", "1.0.0", body, expect=201)
+        self.publish("sb", "1.0.0", body, expect=201)
+        path = self._pv_path(sha)
+        os.unlink(path)
+        # 两个版本同时缺失
+        for name in ("sa", "sb"):
+            self.assertEqual(
+                self.client.get(f"/api/v1/plugins/{name}/versions/1.0.0/download").status_code,
+                404)
+        r = self._repair("sa", "1.0.0", body, expect=200)
+        j = r.json()
+        self.assertEqual(j["affected_versions"], 2)
+        self.assertEqual(j["shared_versions"], 2)
+        names = sorted((s["plugin"], s["version"]) for s in j["shared_version_list"])
+        self.assertEqual(names, [("sa", "1.0.0"), ("sb", "1.0.0")])
+        # 同摘要另一版本随之恢复
+        d = self.client.get("/api/v1/plugins/sb/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.content, body)
+
+    def test_verify_and_repair_revoked_version(self):
+        body = b"revoked-package"
+        sha = hashlib.sha256(body).hexdigest()
+        self.publish("rv", "1.0.0", body, expect=201)
+        r = self.client.post("/api/v1/plugins/rv/versions/1.0.0/revoke",
+                             json={"reason": "defect"})
+        self.assertEqual(r.status_code, 200)
+        # 已撤销版本仍可核验
+        j = self.client.get("/api/v1/plugins/rv/versions/1.0.0/verify").json()
+        self.assertEqual(j["state"], "intact")
+        self.assertTrue(j["revoked"])
+        # 删除后修复已撤销版本：下载恢复且 X-Revoked=true
+        os.unlink(self._pv_path(sha))
+        r = self._repair("rv", "1.0.0", body, expect=200)
+        self.assertEqual(r.json()["state"], "repaired")
+        d = self.client.get("/api/v1/plugins/rv/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.headers["x-revoked"], "true")
+        self.assertEqual(d.headers["x-sha256"], sha)
+
+    def test_repair_requires_token_when_configured(self):
+        from app.config import settings
+        body = b"token-body"
+        self.publish("tk", "1.0.0", body, expect=201)
+        os.unlink(self._pv_path(hashlib.sha256(body).hexdigest()))
+        old = settings.api_token
+        object.__setattr__(settings, "api_token", "s3cret")
+        try:
+            # 核验是读接口，仍然开放
+            self.assertEqual(
+                self.client.get("/api/v1/plugins/tk/versions/1.0.0/verify").status_code,
+                200)
+            # 修复沿用写接口鉴权
+            self.assertEqual(self._repair("tk", "1.0.0", body).status_code, 401)
+            self.assertEqual(
+                self._repair("tk", "1.0.0", body, token="bad").status_code, 401)
+            r = self._repair("tk", "1.0.0", body, token="s3cret", expect=200)
+            self.assertEqual(r.json()["state"], "repaired")
+        finally:
+            object.__setattr__(settings, "api_token", old)
+
+    def test_download_never_returns_corrupt_or_partial_content(self):
+        # 损坏文件不得作为成功下载返回（成功下载必须逐字节等于原包）
+        body = b"never-partial"
+        sha = hashlib.sha256(body).hexdigest()
+        self.publish("np", "1.0.0", body, expect=201)
+        with open(self._pv_path(sha), "wb") as f:
+            f.write(b"")  # 截断成空文件
+        r = self.client.get("/api/v1/plugins/np/versions/1.0.0/download")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "package_corrupt")
+        with open(self._pv_path(sha), "wb") as f:
+            f.write(body + b"extra-tail")
+        r = self.client.get("/api/v1/plugins/np/versions/1.0.0/download")
+        self.assertEqual(r.status_code, 404)
+        self._repair("np", "1.0.0", body, expect=200)
+        d = self.client.get("/api/v1/plugins/np/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.content, body)
+
+    def test_concurrent_repairs_one_replacement_downloads_complete(self):
+        import threading
+        from sqlalchemy import create_engine, event
+        db_file = os.path.join(self.tmp, "repair-concurrency.db")
+        eng = create_engine(
+            f"sqlite+pysqlite:///{db_file}",
+            connect_args={"timeout": 30, "check_same_thread": False})
+
+        @event.listens_for(eng, "connect")
+        def _pragma(dbapi_conn, _rec):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=30000")
+            cur.close()
+
+        from app import database
+        old_engine = database.engine
+        database.engine = eng
+        database.SessionLocal.configure(bind=eng)
+        try:
+            from app.main import init_db
+            init_db()
+            body = bytes(range(256)) * 4096  # 1 MiB
+            sha = hashlib.sha256(body).hexdigest()
+
+            def do_publish():
+                from fastapi.testclient import TestClient
+                local = TestClient(self.app_ref)
+                meta = {"plugin": "cc", "version": "1.0.0", "sha256": sha,
+                        "dependencies": [], "runtimes": [], "conflicts": []}
+                r = local.post(
+                    "/api/v1/plugins/cc/versions",
+                    files={"metadata": (None, _json(meta), "application/json"),
+                           "package": ("cc.bin", io.BytesIO(body),
+                                       "application/octet-stream")})
+                self.assertEqual(r.status_code, 201, r.text)
+            do_publish()
+            os.unlink(os.path.join(self.pkgdir, sha[:2], sha))
+
+            repaired, statuses, errors = [], [], []
+            barrier = threading.Barrier(8)
+
+            def repairer(i):
+                try:
+                    from fastapi.testclient import TestClient
+                    local = TestClient(self.app_ref)
+                    barrier.wait()
+                    r = local.post(
+                        "/api/v1/plugins/cc/versions/1.0.0/repair",
+                        files={"package": ("cc.bin", io.BytesIO(body),
+                                           "application/octet-stream")})
+                    self.assertEqual(r.status_code, 200, r.text)
+                    repaired.append(r.json()["repaired"])
+                except Exception as e:  # noqa: BLE001
+                    errors.append(repr(e))
+
+            def downloader(i):
+                try:
+                    from fastapi.testclient import TestClient
+                    local = TestClient(self.app_ref)
+                    barrier.wait()
+                    r = local.get("/api/v1/plugins/cc/versions/1.0.0/download")
+                    if r.status_code == 200:
+                        # 任何成功下载必须是完整正确内容，绝不允许部分写入
+                        self.assertEqual(r.content, body)
+                        statuses.append("ok")
+                    else:
+                        self.assertEqual(r.status_code, 404)
+                        statuses.append("404")
+                except Exception as e:  # noqa: BLE001
+                    errors.append(repr(e))
+
+            threads = [threading.Thread(target=repairer, args=(i,))
+                       for i in range(4)]
+            threads += [threading.Thread(target=downloader, args=(i,))
+                        for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=120)
+            self.assertEqual(errors, [], errors)
+            self.assertEqual(len(repaired), 4)
+            self.assertEqual(sum(1 for x in repaired if x), 1)  # 仅一次真正替换
+            # 修复窗口内：成功下载必须完整，未完成时允许 404——绝不允许半截内容
+            self.assertTrue(set(statuses) <= {"ok", "404"})
+            # 全部线程结束后：文件完好，下载恢复且逐字节正确
+            from fastapi.testclient import TestClient
+            final = TestClient(self.app_ref).get(
+                "/api/v1/plugins/cc/versions/1.0.0/download")
+            self.assertEqual(final.status_code, 200)
+            self.assertEqual(final.content, body)
+        finally:
+            database.engine = old_engine
+            database.SessionLocal.configure(bind=old_engine)
 
 
 def _json(obj):
