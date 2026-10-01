@@ -246,6 +246,56 @@ class BatchOut(BaseModel):
     created_at: datetime
 
 
+# ----------------------------------------------------------- 安装包核验与修复
+
+# 状态取值与 app.catalog.STATUS_* 一致：ok / missing / corrupt
+VALID_FILE_STATUSES = {"ok", "missing", "corrupt"}
+
+
+class SharedVersion(BaseModel):
+    """共享同一记录 SHA-256 的一个版本。"""
+    plugin: str
+    version: str
+    revoked: bool = False
+    package_url: str
+
+
+class PackageInspectionOut(BaseModel):
+    """单个版本安装包的核验结果（读接口，含已撤销版本）。"""
+    plugin: str
+    version: str
+    sha256: str
+    actual_sha256: str | None = None
+    status: str               # ok / missing / corrupt
+    revoked: bool = False
+    package_url: str
+    sharing_count: int        # 共享该记录摘要的版本数
+    shared_versions: list[SharedVersion]
+
+
+class PackageInventoryOut(BaseModel):
+    """全量盘点结果：每个已发布版本一项（同摘要物理文件只核验一次）。"""
+    total_versions: int
+    ok: int
+    missing: int
+    corrupt: int
+    unique_digests: int
+    results: list[PackageInspectionOut]
+
+
+class PackageRepairOut(BaseModel):
+    """安装包修复结果：不产生目录修订，不改写任何版本元数据。"""
+    plugin: str
+    version: str
+    sha256: str
+    status: str               # ok（本就完好，未改写）/ repaired（已原子修复）
+    written: bool             # 本次是否真正替换了文件
+    previous_status: str      # 修复前状态 ok / missing / corrupt
+    affected_count: int       # 随本次恢复可下载的版本数（含目标版本）
+    affected_versions: list[SharedVersion]
+    package_url: str
+
+
 class OkOut(BaseModel):
     ok: bool = True
     message: str

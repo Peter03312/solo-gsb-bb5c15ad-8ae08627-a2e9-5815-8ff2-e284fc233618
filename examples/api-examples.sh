@@ -214,4 +214,62 @@ curl -sS -X POST "${AUTH[@]}" \
   -F "package=@${PARTS[0]%%|*};filename=pack-b-1.0.0.bin" \
   "$API/batches" | python3 -m json.tool || true
 
+# 16) 安装包核验：发布两个内容相同（共享 SHA-256）的版本
+echo ">>> 发布共享摘要的 keep-a / keep-b"
+publish keep-a 1.0.0 '{"plugin":"keep-a","version":"1.0.0"}' "keep-payload"
+publish keep-b 1.0.0 '{"plugin":"keep-b","version":"1.0.0"}' "keep-payload"
+
+echo ">>> 核验 keep-a==1.0.0（status=ok，sharing_count=2）"
+curl -fsS "$API/plugins/keep-a/versions/1.0.0/package" | python3 -m json.tool
+
+echo ">>> 全量盘点（含计数；可按 ?status=missing|corrupt&plugin=name 过滤）"
+curl -fsS "$API/packages" \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);
+print({k:d[k] for k in ("total_versions","ok","missing","corrupt","unique_digests")})'
+
+# 17) 模拟长期保存导致物理包丢失（内容寻址文件两个版本共享一份）
+KEEP_SHA="$(sha256_file "$tmpdir/keep-a-1.0.0.bin")"
+KEEP_OBJ="$PACKAGE_STORE/${KEEP_SHA:0:2}/$KEEP_SHA"
+# PACKAGE_STORE 未设置时通过核验结果里的 sha256 在默认卷下定位；
+# 容器部署时文件在 packages 卷内，损坏由真实介质故障产生，此处仅为本地演示。
+if [[ -n "${PACKAGE_STORE:-}" && -f "$KEEP_OBJ" ]]; then
+  echo ">>> 模拟丢失：删除 $KEEP_OBJ"
+  rm -f "$KEEP_OBJ"
+
+  echo ">>> 核验变为 missing（keep-b 同样 missing）"
+  curl -fsS "$API/packages?status=missing" | python3 -m json.tool
+
+  echo ">>> 下载缺失包：404 package_unavailable，不会返回错误内容"
+  curl -sS -D - -o /dev/null "$API/plugins/keep-a/versions/1.0.0/download" \
+    | grep -Ei 'HTTP|x-sha256' || true
+
+  echo ">>> 修复：提交与记录摘要一致的替换件（写接口，带 API_TOKEN）"
+  curl -fsS -X POST "${AUTH[@]}" \
+    -F "package=@$tmpdir/keep-a-1.0.0.bin;filename=keep-a-1.0.0.bin" \
+    "$API/plugins/keep-a/versions/1.0.0/package/repair" | python3 -m json.tool
+  # 预期：status=repaired, written=true, affected_count=2,
+  #       affected_versions 含 keep-a 与 keep-b（同摘要版本同时恢复）
+
+  echo ">>> 修复后两版本恢复下载；再次修复 -> status=ok, written=false（不改写）"
+  curl -fsS -D - -o "$tmpdir/keep-b.bin" \
+    "$API/plugins/keep-b/versions/1.0.0/download" | grep -Ei 'HTTP|x-sha256|x-revoked'
+  curl -fsS -X POST "${AUTH[@]}" \
+    -F "package=@$tmpdir/keep-a-1.0.0.bin;filename=keep-a-1.0.0.bin" \
+    "$API/plugins/keep-a/versions/1.0.0/package/repair" \
+    | python3 -c 'import json,sys;d=json.load(sys.stdin);
+print("status:",d["status"],"written:",d["written"],"affected:",d["affected_count"])'
+
+  echo ">>> 摘要不符的替换件：422 sha256_mismatch，原文件保留"
+  printf 'wrong-bytes' > "$tmpdir/wrong.bin"
+  curl -sS -X POST "${AUTH[@]}" \
+    -F "package=@$tmpdir/wrong.bin;filename=wrong.bin" \
+    "$API/plugins/keep-a/versions/1.0.0/package/repair" | python3 -m json.tool || true
+else
+  echo ">>> 跳过丢失/修复实演（设置 PACKAGE_STORE=<内容寻址根目录> 后启用）"
+  echo "    修复接口用法："
+  echo "    curl -X POST -H \"Authorization: Bearer \$API_TOKEN\" \\"
+  echo "      -F package=@keep-a-1.0.0.bin \\"
+  echo "      $API/plugins/keep-a/versions/1.0.0/package/repair"
+fi
+
 echo "全部示例执行完成。"

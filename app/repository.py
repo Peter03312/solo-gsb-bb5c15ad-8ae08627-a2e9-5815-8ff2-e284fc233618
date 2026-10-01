@@ -21,6 +21,24 @@ from .solver import Candidate, RuntimeRequirement, Snapshot
 from .version import SpecifierSet, Version
 
 
+@dataclass
+class RepairOutcome:
+    """一次安装包修复（原子替换）的结果。
+
+    修复**不写数据库**：版本元数据、目录修订、历史方案一律不变，
+    同摘要的其它版本仅因共享的内容寻址文件被扶正而恢复可下载。
+    """
+    plugin: str
+    version: str
+    sha256: str
+    storage_path: str
+    previous_status: str          # ok / missing / corrupt
+    status: str                   # ok（完好未改写）/ repaired（已原子修复）
+    written: bool                 # 本次是否真正替换了文件
+    affected_versions: list       # [(plugin_name, version, revoked_revision)]
+    affected_count: int           # 修复后由 missing/corrupt 转为完好的版本数
+
+
 def _orm():
     """延迟加载 ORM 符号。"""
     from sqlalchemy import func, select
@@ -306,6 +324,132 @@ def revoke_version(db: Any, *, plugin_name: str, version: str,
     pv.revoke_reason = reason
     db.flush()
     return revision.revision
+
+
+# ---------------------------------------------------------------- 包核验与修复
+#
+# 核验/修复针对的是**内容寻址存储中的物理文件**，与目录可见性无关：
+# 已撤销版本同样可核验、可修复。以下函数只读数据库；修复绝不产生
+# 目录修订，也不改动任何版本行。
+
+def get_version_row(db: Any, plugin_name: str, version: str):
+    """按已发布插件名 + 版本号取版本行（含已撤销）；不存在返回 None。"""
+    o = _orm()
+    return db.execute(
+        o.select(o.PluginVersion, o.Plugin.name)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.Plugin.name == plugin_name, o.PluginVersion.version == version)
+    ).first()
+
+
+def versions_sharing_sha(db: Any, sha256: str) -> list[tuple]:
+    """共享同一记录摘要的全部版本（含已撤销），按 (插件名, 版本) 排序。
+
+    返回 ``[(plugin_name, version, revoked_revision_or_None), ...]``。
+    内容寻址存储中同一摘要只对应一个物理文件，修复一次即对这些版本
+    同时生效。
+    """
+    o = _orm()
+    rows = db.execute(
+        o.select(o.Plugin.name, o.PluginVersion.version,
+                 o.PluginVersion.revoked_revision)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.PluginVersion.sha256 == sha256)
+        .order_by(o.Plugin.name, o.PluginVersion.version)
+    ).all()
+    return [(name, ver, revoked_rev) for name, ver, revoked_rev in rows]
+
+
+def all_version_rows(db: Any, plugin_name: str | None = None):
+    """读取全部版本行（含已撤销），按 (插件名, 版本) 确定排序。
+
+    同一记录摘要在内容寻址存储中只对应一个物理文件，故全量盘点按
+    sha256 去重核验磁盘文件，再把状态映射回每个版本。
+    """
+    o = _orm()
+    stmt = (
+        o.select(o.PluginVersion, o.Plugin.name)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+    )
+    if plugin_name is not None:
+        stmt = stmt.where(o.Plugin.name == plugin_name)
+    stmt = stmt.order_by(o.Plugin.name, o.PluginVersion.version)
+    return list(db.execute(stmt).all())
+
+
+def inspect_version(db: Any, plugin_name: str, version: str):
+    """核验单个已发布版本的安装包。
+
+    返回 ``(版本行对象, 插件名, 状态, 实际摘要, 共享版本列表)``；
+    未知版本返回 None。
+    """
+    row = get_version_row(db, plugin_name, version)
+    if row is None:
+        return None
+    pv, name = row
+    status, actual = catalog.inspect_package_file(pv.storage_path, pv.sha256)
+    sharing = versions_sharing_sha(db, pv.sha256)
+    return pv, name, status, actual, sharing
+
+
+def inspect_all(db: Any, plugin_name: str | None = None):
+    """全量盘点：返回每个版本行的核验结果（物理文件按摘要去重，只算一次）。
+
+    返回 ``[(pv, name, status, actual_or_None, sharing_rows), ...]``，
+    按 (插件名, 版本) 排序；``plugin_name`` 给出时只盘点该插件。
+    ``sharing_rows`` 为共享该摘要的版本三元组列表（含撤销标记）。
+    """
+    rows = all_version_rows(db, plugin_name)
+    file_cache: dict[str, tuple[str, str | None]] = {}
+    sharing_cache: dict[str, list] = {}
+    out = []
+    for pv, name in rows:
+        if pv.sha256 not in file_cache:
+            file_cache[pv.sha256] = catalog.inspect_package_file(
+                pv.storage_path, pv.sha256)
+        if pv.sha256 not in sharing_cache:
+            sharing_cache[pv.sha256] = versions_sharing_sha(db, pv.sha256)
+        status, actual = file_cache[pv.sha256]
+        out.append((pv, name, status, actual, sharing_cache[pv.sha256]))
+    return out
+
+
+def repair_version_file(db: Any, *, plugin_name: str, version: str,
+                        src_path: str) -> RepairOutcome:
+    """用摘要与记录一致的替换件原子修复安装包（不写数据库）。
+
+    * 未知版本 -> :class:`catalog.PublishError`（路由映射 404）；
+    * 上传件 SHA-256 与版本记录不符 -> :class:`catalog.PublishError`
+      （路由映射 422，原文件保留）；
+    * 目标本就完好 -> 不改写，status="ok"；
+    * 缺失/损坏 -> 同目录临时文件 + os.replace 原子换入；写盘失败抛
+      :class:`catalog.RepairStorageError`，原文件保留；
+    * 同摘要的其它版本共享同一内容寻址文件，随本次修复一并恢复可下载。
+    """
+    row = get_version_row(db, plugin_name, version)
+    if row is None:
+        raise catalog.PublishError(f"未找到已发布版本 {plugin_name}=={version}")
+    pv, _name = row
+
+    # 只认版本记录中的摘要；摘要不符明确拒绝，绝不动原文件
+    catalog.verify_sha256(src_path, pv.sha256)
+
+    previous_status, _actual = catalog.inspect_package_file(
+        pv.storage_path, pv.sha256)
+    status, written = catalog.restore_package_atomic(
+        src_path, pv.sha256, pv.storage_path)
+
+    sharing = versions_sharing_sha(db, pv.sha256)
+    if written:
+        affected_count = len(sharing)
+    else:
+        # 完好未改写：没有任何版本状态发生变化
+        affected_count = 0
+    return RepairOutcome(
+        plugin=plugin_name, version=version, sha256=pv.sha256,
+        storage_path=pv.storage_path, previous_status=previous_status,
+        status=status, written=written, affected_versions=sharing,
+        affected_count=affected_count)
 
 
 # ---------------------------------------------------------------- 快照

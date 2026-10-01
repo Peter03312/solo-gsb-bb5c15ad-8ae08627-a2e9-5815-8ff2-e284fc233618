@@ -102,6 +102,58 @@ class Client:
     def batch(self, batch_id: str):
         return self._request("GET", f"/batches/{batch_id}")
 
+    def inspect_package(self, plugin: str, version: str):
+        """核验单个版本安装包：记录摘要 / 实测摘要 / ok|missing|corrupt。"""
+        return self._request(
+            "GET", f"/plugins/{plugin}/versions/{version}/package")
+
+    def inventory(self, plugin: str | None = None, status: str | None = None):
+        """全量盘点安装包（含已撤销版本），可按插件/状态过滤。"""
+        qs = []
+        if plugin:
+            qs.append(f"plugin={plugin}")
+        if status:
+            qs.append(f"status={status}")
+        suffix = ("?" + "&".join(qs)) if qs else ""
+        return self._request("GET", f"/packages{suffix}")
+
+    def repair_package(self, plugin: str, version: str, payload: bytes):
+        """提交替换件修复缺失/损坏的安装包（写接口，需要 token）。
+
+        服务端只认版本记录的 SHA-256；完好包不改写；同摘要的其它版本
+        随之恢复可下载。
+        """
+        boundary = "----labrepair" + uuid.uuid4().hex
+        buf = io.BytesIO()
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(
+            f'Content-Disposition: form-data; name="package"; '
+            f'filename="{plugin}-{version}.bin"\r\n'.encode())
+        buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
+        buf.write(payload)
+        buf.write(f"\r\n--{boundary}--\r\n".encode())
+        return self._request(
+            "POST", f"/plugins/{plugin}/versions/{version}/package/repair",
+            data=buf.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def download(self, plugin: str, version: str):
+        """下载安装包（字节流），缺失/损坏时服务端返回 404。"""
+        req = urllib.request.Request(
+            self.base + f"/plugins/{plugin}/versions/{version}/download")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = raw.decode("utf-8", "replace")
+            return e.code, dict(e.headers), payload
+
     def solve(self, req: dict):
         return self._request("POST", "/solutions", data=req)
 
@@ -307,6 +359,61 @@ def main() -> int:
     st, _, berr = c.publish_batch("batch-demo-dup", [b_lib, b_lib])
     show("批次内重复成员（409）", st, berr)
     assert st == 409
+
+    # ------------------------------------------------------- 安装包核验与修复
+    # 发布两个**内容相同**（共享 SHA-256）的版本，模拟长期保存后包文件丢失
+    same = b"same-bytes-content"
+    same_meta = {"runtimes": [], "dependencies": [], "conflicts": []}
+    st, _, _ = c.publish({**same_meta, "plugin": "same-a", "version": "1.0.0",
+                          "sha256": hashlib.sha256(same).hexdigest()}, same)
+    assert st == 201
+    st, _, _ = c.publish({**same_meta, "plugin": "same-b", "version": "2.0.0",
+                          "sha256": hashlib.sha256(same).hexdigest()}, same)
+    assert st == 201
+
+    # 核验：完好状态 + 共享摘要版本数
+    st, _, insp = c.inspect_package("same-a", "1.0.0")
+    show("核验 same-a==1.0.0", st, {
+        "status": insp["status"], "sha256": insp["sha256"],
+        "sharing_count": insp["sharing_count"],
+        "shared_versions": [(v["plugin"], v["version"])
+                           for v in insp["shared_versions"]]})
+    assert st == 200 and insp["status"] == "ok"
+    assert insp["sharing_count"] == 2
+
+    # 全量盘点
+    st, _, inv = c.inventory()
+    show("全量盘点", st, {k: inv[k] for k in
+                          ("total_versions", "ok", "missing", "corrupt",
+                           "unique_digests")})
+    assert st == 200 and inv["missing"] == 0 and inv["corrupt"] == 0
+
+    # 模拟运维侧发现物理包丢失（实际环境中文件可能被误删/介质损坏）。
+    # 下载缺失/损坏包会拿到 404 package_unavailable，且绝不会返回错误内容：
+    st, _, derr = c.download("same-a", "1.0.0")  # 当前完好，应为 200
+    show("完好包下载（200，头部含 X-SHA256/X-Revoked）", st,
+         {"bytes": len(derr) if st == 200 else derr})
+    assert st == 200
+
+    # 修复保护：提交摘要与记录不符的替换件 -> 422，原文件保留
+    st, _, rerr = c.repair_package("same-a", "1.0.0", b"totally-different")
+    show("修复摘要不符（应 422 拒绝）", st, rerr)
+    assert st == 422 and rerr["detail"]["code"] == "sha256_mismatch"
+
+    # 完好包重复修复 -> status=ok, written=false（不改写）
+    st, _, rep = c.repair_package("same-a", "1.0.0", same)
+    show("修复完好包（应 status=ok、written=false）", st, {
+        "status": rep["status"], "written": rep["written"],
+        "affected_count": rep["affected_count"]})
+    assert st == 200 and rep["status"] == "ok" and rep["written"] is False
+
+    # 真实修复流程（缺失/损坏后）：提交与记录摘要一致的原始包字节，
+    # 一次原子修复即让共享该摘要的全部版本恢复可下载：
+    #   curl -X POST -H "Authorization: Bearer $API_TOKEN" \
+    #     -F "package=@same-a-1.0.0.bin" \
+    #     "$API/plugins/same-a/versions/1.0.0/package/repair"
+    # -> {"status":"repaired","affected_count":2,
+    #     "affected_versions":[{"plugin":"same-a",...},{"plugin":"same-b",...}]}
 
     print("\n全部示例断言通过。")
     return 0

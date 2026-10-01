@@ -804,6 +804,332 @@ class ApiTests(unittest.TestCase):
         d = self.client.get("/api/v1/plugins/mix/versions/1.0.0/download")
         self.assertEqual(d.content, b"mix")
 
+    # --------------------------------------------------- 安装包核验与修复
+    def _storage_path(self, plugin, version):
+        from app.models import Plugin, PluginVersion
+        from sqlalchemy import select
+        from app.database import SessionLocal
+        with SessionLocal() as db:
+            return db.execute(
+                select(PluginVersion.storage_path).join(
+                    Plugin, Plugin.id == PluginVersion.plugin_id)
+                .where(Plugin.name == plugin, PluginVersion.version == version)
+            ).scalar_one()
+
+    def _repair(self, plugin, version, payload, token=None):
+        files = {"package": (f"{plugin}-{version}.bin",
+                             io.BytesIO(payload), "application/octet-stream")}
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        return self.client.post(
+            f"/api/v1/plugins/{plugin}/versions/{version}/package/repair",
+            files=files, headers=headers)
+
+    def test_inspect_single_and_inventory(self):
+        self.publish("iv-a", "1.0.0", b"shared")
+        self.publish("iv-b", "1.0.0", b"shared")   # 同摘要
+        self.publish("iv-c", "1.0.0", b"unique")
+
+        r = self.client.get("/api/v1/plugins/iv-a/versions/1.0.0/package")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["sha256"], hashlib.sha256(b"shared").hexdigest())
+        self.assertEqual(body["actual_sha256"], body["sha256"])
+        self.assertEqual(body["sharing_count"], 2)
+        self.assertEqual([(v["plugin"], v["version"])
+                          for v in body["shared_versions"]],
+                         [("iv-a", "1.0.0"), ("iv-b", "1.0.0")])
+
+        inv = self.client.get("/api/v1/packages").json()
+        self.assertEqual(inv["total_versions"], 3)
+        self.assertEqual(inv["ok"], 3)
+        self.assertEqual(inv["missing"], 0)
+        self.assertEqual(inv["corrupt"], 0)
+        self.assertEqual(inv["unique_digests"], 2)  # 同摘要只算一次
+
+    def test_inspect_unknown_version_404(self):
+        r = self.client.get("/api/v1/plugins/ghost/versions/1.0.0/package")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "unknown_version")
+
+    def test_inspect_covers_revoked_versions(self):
+        self.publish("iv-rv", "1.0.0", b"rv")
+        self.client.post("/api/v1/plugins/iv-rv/versions/1.0.0/revoke",
+                         json={"reason": "x"})
+        r = self.client.get("/api/v1/plugins/iv-rv/versions/1.0.0/package")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["revoked"])
+        self.assertTrue(body["shared_versions"][0]["revoked"])
+        # 全量盘点也包含已撤销版本
+        inv = self.client.get("/api/v1/packages").json()
+        self.assertEqual(inv["total_versions"], 1)
+
+    def test_inventory_filters_and_counts_missing_corrupt(self):
+        self.publish("fl-a", "1.0.0", b"shared")
+        self.publish("fl-b", "1.0.0", b"shared")
+        self.publish("fl-c", "1.0.0", b"solo-c")
+
+        # 删除共享文件 -> 2 个 missing；写坏 fl-c -> corrupt
+        shared_path = self._storage_path("fl-a", "1.0.0")
+        os.unlink(shared_path)
+        solo_path = self._storage_path("fl-c", "1.0.0")
+        with open(solo_path, "wb") as f:
+            f.write(b"broken-bytes")
+
+        inv = self.client.get("/api/v1/packages").json()
+        self.assertEqual((inv["ok"], inv["missing"], inv["corrupt"]), (0, 2, 1))
+        # 汇总计数是全量的（不受 status 过滤影响）
+        missing = self.client.get("/api/v1/packages?status=missing").json()
+        self.assertEqual(missing["total_versions"], 3)
+        self.assertEqual(len(missing["results"]), 2)
+        self.assertTrue(all(v["status"] == "missing" for v in missing["results"]))
+
+        by_plugin = self.client.get("/api/v1/packages?plugin=fl-c").json()
+        self.assertEqual(by_plugin["total_versions"], 1)
+        self.assertEqual(by_plugin["results"][0]["status"], "corrupt")
+        self.assertEqual(by_plugin["results"][0]["sha256"],
+                         hashlib.sha256(b"solo-c").hexdigest())
+        self.assertNotEqual(by_plugin["results"][0]["actual_sha256"],
+                            hashlib.sha256(b"solo-c").hexdigest())
+
+        bad = self.client.get("/api/v1/packages?status=bogus")
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/v1/packages?plugin=ghost").status_code, 404)
+
+    def test_download_404_when_missing_or_corrupt(self):
+        self.publish("dl-miss", "1.0.0", b"will-disappear")
+        self.publish("dl-bad", "1.0.0", b"will-corrupt")
+        os.unlink(self._storage_path("dl-miss", "1.0.0"))
+        with open(self._storage_path("dl-bad", "1.0.0"), "wb") as f:
+            f.write(b"partial-content")
+
+        r = self.client.get("/api/v1/plugins/dl-miss/versions/1.0.0/download")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "package_unavailable")
+        self.assertEqual(r.json()["detail"]["status"], "missing")
+
+        r = self.client.get("/api/v1/plugins/dl-bad/versions/1.0.0/download")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "package_unavailable")
+        self.assertEqual(r.json()["detail"]["status"], "corrupt")
+        # 缺失/损坏绝不能作为成功下载返回内容
+        self.assertNotIn(b"partial", r.content)
+
+        # 未知版本同样 404
+        r = self.client.get("/api/v1/plugins/nope/versions/1.0.0/download")
+        self.assertEqual(r.status_code, 404)
+
+    def test_repair_missing_restores_sharing_versions_and_download(self):
+        self.publish("rp-a", "1.0.0", b"shared-payload")
+        self.publish("rp-b", "1.0.0", b"shared-payload")
+        revs_before = [r["revision"]
+                       for r in self.client.get("/api/v1/revisions").json()]
+        os.unlink(self._storage_path("rp-a", "1.0.0"))
+        # 修复前：两版本均不可下载
+        self.assertEqual(
+            self.client.get("/api/v1/plugins/rp-a/versions/1.0.0/download")
+            .status_code, 404)
+
+        r = self._repair("rp-a", "1.0.0", b"shared-payload")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["status"], "repaired")
+        self.assertTrue(body["written"])
+        self.assertEqual(body["previous_status"], "missing")
+        self.assertEqual(body["affected_count"], 2)
+        self.assertEqual([(v["plugin"], v["version"])
+                          for v in body["affected_versions"]],
+                         [("rp-a", "1.0.0"), ("rp-b", "1.0.0")])
+
+        # 同摘要的另一个版本随之恢复，头部兼容
+        for name in ("rp-a", "rp-b"):
+            d = self.client.get(
+                f"/api/v1/plugins/{name}/versions/1.0.0/download")
+            self.assertEqual(d.status_code, 200)
+            self.assertEqual(d.content, b"shared-payload")
+            self.assertEqual(d.headers["x-sha256"],
+                             hashlib.sha256(b"shared-payload").hexdigest())
+            self.assertEqual(d.headers["x-revoked"], "false")
+
+        # 修复不产生目录修订、不改元数据
+        revs_after = [r["revision"]
+                      for r in self.client.get("/api/v1/revisions").json()]
+        self.assertEqual(revs_after, revs_before)
+        info = self.client.get("/api/v1/plugins/rp-a/versions/1.0.0").json()
+        self.assertEqual(info["sha256"],
+                         hashlib.sha256(b"shared-payload").hexdigest())
+
+    def test_repair_corrupt_and_intact_idempotent(self):
+        self.publish("rp-c", "1.0.0", b"payload-c")
+        path = self._storage_path("rp-c", "1.0.0")
+        with open(path, "wb") as f:
+            f.write(b"broken")
+        r = self._repair("rp-c", "1.0.0", b"payload-c")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "repaired")
+        self.assertEqual(r.json()["previous_status"], "corrupt")
+
+        # 再次提交：完好包不改写
+        r2 = self._repair("rp-c", "1.0.0", b"payload-c")
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()["status"], "ok")
+        self.assertFalse(r2.json()["written"])
+        self.assertEqual(r2.json()["affected_count"], 0)
+
+    def test_repair_sha_mismatch_422_keeps_original(self):
+        self.publish("rp-mm", "1.0.0", b"original")
+        path = self._storage_path("rp-mm", "1.0.0")
+        os.unlink(path)
+        r = self._repair("rp-mm", "1.0.0", b"different-content")
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["code"], "sha256_mismatch")
+        self.assertFalse(os.path.exists(path))
+
+        # 损坏状态下：坏文件原样保留
+        with open(path, "wb") as f:
+            f.write(b"broken")
+        r = self._repair("rp-mm", "1.0.0", b"different-content")
+        self.assertEqual(r.status_code, 422)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"broken")
+
+    def test_repair_unknown_version_404(self):
+        files = {"package": ("x.bin", io.BytesIO(b"x"),
+                             "application/octet-stream")}
+        r = self.client.post(
+            "/api/v1/plugins/ghost/versions/1.0.0/package/repair", files=files)
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "unknown_version")
+
+    def test_repair_requires_token_when_configured(self):
+        from app.config import settings
+        self.publish("rp-auth", "1.0.0", b"auth-payload", expect=201)
+        os.unlink(self._storage_path("rp-auth", "1.0.0"))
+        old_token = settings.api_token
+        object.__setattr__(settings, "api_token", "secret-token")
+        try:
+            # 无 token -> 401
+            r = self._repair("rp-auth", "1.0.0", b"auth-payload")
+            self.assertEqual(r.status_code, 401)
+            # 文件仍缺失
+            self.assertFalse(os.path.exists(
+                self._storage_path("rp-auth", "1.0.0")))
+            # 核验是读接口，无 token 也开放
+            r = self.client.get(
+                "/api/v1/plugins/rp-auth/versions/1.0.0/package")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["status"], "missing")
+            # 带正确 token 修复成功
+            r = self._repair("rp-auth", "1.0.0", b"auth-payload",
+                             token="secret-token")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["status"], "repaired")
+        finally:
+            object.__setattr__(settings, "api_token", old_token)
+
+    def test_repair_concurrent_with_download_and_other_repair(self):
+        """修复/下载/另一修复并发：下载只能拿到完整内容，最终文件完好。"""
+        import threading
+        self.publish("rp-conc", "1.0.0", b"concurrent-payload")
+        path = self._storage_path("rp-conc", "1.0.0")
+        os.unlink(path)
+
+        errors = []
+        download_bodies = []
+
+        def repairer():
+            try:
+                r = self._repair("rp-conc", "1.0.0", b"concurrent-payload")
+                if r.status_code != 200:
+                    errors.append(f"repair {r.status_code}: {r.text}")
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        def downloader():
+            try:
+                r = self.client.get(
+                    "/api/v1/plugins/rp-conc/versions/1.0.0/download")
+                # 修复完成前允许 404；一旦 200，内容必须完整且头部正确
+                if r.status_code == 200:
+                    download_bodies.append(r.content)
+                    if r.content != b"concurrent-payload":
+                        errors.append("partial/wrong content served")
+                    if r.headers["x-sha256"] != hashlib.sha256(
+                            b"concurrent-payload").hexdigest():
+                        errors.append("bad X-SHA256 header")
+                elif r.status_code != 404:
+                    errors.append(f"download {r.status_code}")
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        threads = ([threading.Thread(target=repairer) for _ in range(4)]
+                   + [threading.Thread(target=downloader) for _ in range(8)])
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertEqual(errors, [], errors)
+        # 最终全部可下载且内容正确
+        d = self.client.get(
+            "/api/v1/plugins/rp-conc/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.content, b"concurrent-payload")
+        # 无临时文件残留
+        leftovers = [n for n in os.listdir(os.path.dirname(path))
+                     if n.startswith(".repair-")]
+        self.assertEqual(leftovers, [])
+
+    def test_revoked_version_repairable_with_headers(self):
+        self.publish("rp-rv", "1.0.0", b"revoked-payload")
+        self.client.post("/api/v1/plugins/rp-rv/versions/1.0.0/revoke",
+                         json={"reason": "x"})
+        os.unlink(self._storage_path("rp-rv", "1.0.0"))
+        # 已撤销版本仍可核验/修复
+        r = self.client.get(
+            "/api/v1/plugins/rp-rv/versions/1.0.0/package")
+        self.assertEqual(r.json()["status"], "missing")
+        r = self._repair("rp-rv", "1.0.0", b"revoked-payload")
+        self.assertEqual(r.status_code, 200, r.text)
+        d = self.client.get(
+            "/api/v1/plugins/rp-rv/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.headers["x-revoked"], "true")
+        self.assertEqual(d.content, b"revoked-payload")
+
+    def test_repair_write_failure_keeps_original(self):
+        from app import catalog
+        self.publish("rp-io", "1.0.0", b"io-payload")
+        path = self._storage_path("rp-io", "1.0.0")
+        with open(path, "wb") as f:
+            f.write(b"broken-original")
+
+        orig = catalog.os.replace
+
+        def boom(src, dst):
+            raise OSError("simulated rename failure")
+        catalog.os.replace = boom
+        try:
+            r = self._repair("rp-io", "1.0.0", b"io-payload")
+            self.assertEqual(r.status_code, 507, r.text)
+            self.assertEqual(r.json()["detail"]["code"],
+                             "repair_write_failed")
+        finally:
+            catalog.os.replace = orig
+
+        # 原坏文件原样保留，临时文件清理
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"broken-original")
+        leftovers = [n for n in os.listdir(os.path.dirname(path))
+                     if n.startswith(".repair-")]
+        self.assertEqual(leftovers, [])
+        # 随后正常修复可成功
+        r = self._repair("rp-io", "1.0.0", b"io-payload")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "repaired")
+
 
 def _json(obj):
     import json

@@ -12,16 +12,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 
 from .solver import Candidate, RuntimeRequirement, Snapshot
 from .version import InvalidSpecifier, InvalidVersion, SpecifierSet, Version
 
 __all__ = [
-    "PublishError", "BatchConflict", "BatchStorageError",
+    "PublishError", "BatchConflict", "BatchStorageError", "RepairStorageError",
     "validate_metadata_specs", "verify_sha256",
-    "save_package_atomic", "canonical_request", "canonical_batch",
+    "save_package_atomic", "restore_package_atomic", "inspect_package_file",
+    "canonical_request", "canonical_batch",
+    "STATUS_OK", "STATUS_MISSING", "STATUS_CORRUPT",
 ]
+
+# 安装包核验状态（机器可读，与 HTTP 状态无关）
+STATUS_OK = "ok"
+STATUS_MISSING = "missing"
+STATUS_CORRUPT = "corrupt"
 
 
 class PublishError(ValueError):
@@ -99,7 +107,7 @@ def save_package_atomic(src_path: str, sha256: str, dest_dir: str,
     size = os.path.getsize(src_path)
     created = False
     if not os.path.exists(final_path):
-        tmp_path = os.path.join(bucket, f".tmp-{os.getpid()}-{sha256}")
+        tmp_path = _atomic_tmp_path(bucket, sha256)
         try:
             shutil.move(src_path, tmp_path)
             os.replace(tmp_path, final_path)
@@ -107,7 +115,114 @@ def save_package_atomic(src_path: str, sha256: str, dest_dir: str,
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+    else:
+        # 内容寻址目标已存在时通常无需落盘；但磁盘上的旧包可能已损坏
+        # （长期保存介质损坏，或正由修复接口处理）。仅凭路径存在就跳过会让
+        # 一次同摘要发布引用坏文件，因此先核验：损坏则用本次完整上传原子扶正，
+        # 完好文件绝不改写，避免与并发下载/修复互相覆盖。
+        if inspect_package_file(final_path, sha256)[0] != STATUS_OK:
+            tmp_path = _atomic_tmp_path(bucket, sha256)
+            try:
+                shutil.copy2(src_path, tmp_path)
+                os.replace(tmp_path, final_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
     return final_path, size, created
+
+
+class RepairStorageError(IOError):
+    """修复安装包写盘失败（原文件必须保持不变）。"""
+
+
+def inspect_package_file(path: str, expected_sha256: str) -> tuple[str, str | None]:
+    """核验磁盘上的内容寻址文件：返回 ``(状态, 实际摘要)``。
+
+    * ``ok``      —— 文件存在且 SHA-256 与记录一致（actual == expected）；
+    * ``missing`` —— 路径不存在（含悬挂路径/目录项丢失）；
+    * ``corrupt`` —— 文件存在但摘要不符，或无法完整读取（I/O 错误、
+                    读到半截内容等），此时 actual 尽量给出实测摘要，
+                    无法读取时为 None。
+
+    纯只读操作，不修改任何文件。
+    """
+    if not os.path.exists(path):
+        return STATUS_MISSING, None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return STATUS_CORRUPT, None
+    actual = h.hexdigest()
+    if actual == expected_sha256.lower():
+        return STATUS_OK, actual
+    return STATUS_CORRUPT, actual
+
+
+def _atomic_tmp_path(directory: str, sha256: str) -> str:
+    """同目录唯一名临时文件：同目录 + os.replace 才是原子替换。
+
+    随机后缀让多进程/多请求并发修复同一摘要时各自使用独立临时文件，
+    互不踩踏；不使用固定名，避免并发清理到对方正在写入的临时文件。
+    """
+    return os.path.join(
+        directory, f".repair-{os.getpid()}-{secrets.token_hex(8)}-{sha256}")
+
+
+def restore_package_atomic(src_path: str, expected_sha256: str,
+                           dest_path: str) -> tuple[str, bool]:
+    """以只认记录摘要的方式原子修复一个内容寻址包文件。
+
+    调用方须先用 :func:`verify_sha256` 确认上传件 ``src_path`` 的 SHA-256
+    恰为记录值 ``expected_sha256``（不符应在路由层拒绝，不进入本函数）。
+
+    * 目标完好（存在且摘要一致）：**不改写**，返回 ``("ok", False)``。
+      并发的另一个修复/发布/下载已经确认过完好文件，绝不能互相覆盖。
+    * 目标缺失或损坏：把上传件写到**目标所在目录**下的唯一临时文件，
+      fsync 后用 :func:`os.replace` 原子换入，返回 ``("repaired", True)``。
+      任何并发下载只会看到“旧文件/新文件”二者之一，读不到半截内容；
+      写盘失败时只清理本次临时文件，原文件保持原样并抛
+      :class:`RepairStorageError`。
+
+    返回 ``(状态, 是否实际写入)``。
+    """
+    status, _actual = inspect_package_file(dest_path, expected_sha256)
+    if status == STATUS_OK:
+        return STATUS_OK, False
+
+    dest_dir = os.path.dirname(dest_path) or "."
+    os.makedirs(dest_dir, exist_ok=True)
+    tmp_path = _atomic_tmp_path(dest_dir, expected_sha256)
+    try:
+        # 同目录临时文件保证 os.replace 是同文件系统的原子 rename
+        with open(src_path, "rb") as fin, open(tmp_path, "wb") as fout:
+            shutil.copyfileobj(fin, fout, length=1024 * 1024)
+            fout.flush()
+            try:
+                os.fsync(fout.fileno())
+            except OSError:
+                # 某些文件系统（测试用 tmpfs/某些卷）不支持 fsync：
+                # rename 原子性不依赖它，仅持久性保证弱化
+                pass
+        # 换入前最后一道防线：临时文件必须确为记录摘要，防止任何路径混淆
+        tmp_status, _ = inspect_package_file(tmp_path, expected_sha256)
+        if tmp_status != STATUS_OK:
+            raise RepairStorageError(
+                f"修复文件换入前复核失败（期望 {expected_sha256}）：原文件保留")
+        try:
+            os.replace(tmp_path, dest_path)
+        except OSError as e:
+            raise RepairStorageError(
+                f"安装包原子替换失败: {e}；原文件保留") from e
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return "repaired", True
 
 
 # ---------------------------------------------------------------- 请求规范化

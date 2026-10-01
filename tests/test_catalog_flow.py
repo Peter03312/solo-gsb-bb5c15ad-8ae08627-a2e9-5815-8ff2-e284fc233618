@@ -229,6 +229,55 @@ def install(mdb: MemoryDB, pkgdir: str):
         return {r.id: r.revoked_revision is not None
                 for r in db.rows if r.id in ids}
 
+    # ---- 安装包核验与修复（与 repository 同名函数语义同构；只读 DB）----
+    def get_version_row(db, plugin_name, version):
+        row = next((r for r in db.rows
+                    if r.plugin_name == plugin_name and r.version == version), None)
+        return None if row is None else (row, plugin_name)
+
+    def versions_sharing_sha(db, sha256):
+        return [(r.plugin_name, r.version, r.revoked_revision)
+                for r in db.rows if r.sha256 == sha256]
+
+    def inspect_version(db, plugin_name, version):
+        got = get_version_row(db, plugin_name, version)
+        if got is None:
+            return None
+        row, name = got
+        status, actual = catalog.inspect_package_file(row.storage_path, row.sha256)
+        return row, name, status, actual, versions_sharing_sha(db, row.sha256)
+
+    def inspect_all(db, plugin_name=None):
+        fc = {}
+        sc = {}
+        out = []
+        for r in db.rows:
+            if plugin_name is not None and r.plugin_name != plugin_name:
+                continue
+            if r.sha256 not in fc:
+                fc[r.sha256] = catalog.inspect_package_file(r.storage_path, r.sha256)
+            if r.sha256 not in sc:
+                sc[r.sha256] = versions_sharing_sha(db, r.sha256)
+            st, actual = fc[r.sha256]
+            out.append((r, r.plugin_name, st, actual, sc[r.sha256]))
+        return out
+
+    def repair_version_file(db, *, plugin_name, version, src_path):
+        got = get_version_row(db, plugin_name, version)
+        if got is None:
+            raise catalog.PublishError(f"未找到已发布版本 {plugin_name}=={version}")
+        row, _name = got
+        catalog.verify_sha256(src_path, row.sha256)
+        previous, _ = catalog.inspect_package_file(row.storage_path, row.sha256)
+        status, written = catalog.restore_package_atomic(
+            src_path, row.sha256, row.storage_path)
+        sharing = versions_sharing_sha(db, row.sha256)
+        return repository.RepairOutcome(
+            plugin=plugin_name, version=version, sha256=row.sha256,
+            storage_path=row.storage_path, previous_status=previous,
+            status=status, written=written, affected_versions=sharing,
+            affected_count=len(sharing) if written else 0)
+
     repository.latest_revision = latest_revision
     repository.bump_revision = bump_revision
     repository.publish_version = publish_version
@@ -241,6 +290,11 @@ def install(mdb: MemoryDB, pkgdir: str):
     repository.get_solution = get_solution
     repository.save_solution = save_solution
     repository.revoked_flags = revoked_flags
+    repository.get_version_row = get_version_row
+    repository.versions_sharing_sha = versions_sharing_sha
+    repository.inspect_version = inspect_version
+    repository.inspect_all = inspect_all
+    repository.repair_version_file = repair_version_file
 
 
 class Meta:
@@ -430,6 +484,208 @@ class MemoryFlowTests(unittest.TestCase):
                 package_dir=self.pkgdir)
         self.assertEqual(self.db.revisions, [])
         self.assertNotIn("badsha", self.db.batches)
+
+    # ------------------------------------------------ 安装包核验与修复
+    def _row(self, plugin, version):
+        return next(r for r in self.db.rows
+                    if r.plugin_name == plugin and r.version == version)
+
+    def _repair_src(self, content: str):
+        fd, path = tempfile.mkstemp(dir=self.pkgdir)
+        with os.fdopen(fd, "wb") as f:
+            f.write(content.encode())
+        return path
+
+    def test_inspect_ok_missing_corrupt_and_sharing_count(self):
+        # 两个不同插件版本使用**相同内容**（共享摘要），第三个独立
+        self.publish("dup-a", "1.0.0", "same-bytes")
+        self.publish("dup-b", "1.0.0", "same-bytes")
+        self.publish("solo", "1.0.0", "solo-bytes")
+
+        pv_a = self._row("dup-a", "1.0.0")
+        pv_solo = self._row("solo", "1.0.0")
+
+        # 全部完好
+        found = repository.inspect_version(self.db, "dup-a", "1.0.0")
+        _r, _n, status, actual, sharing = found
+        self.assertEqual(status, catalog.STATUS_OK)
+        self.assertEqual(actual, pv_a.sha256)
+        self.assertEqual(len(sharing), 2)
+        self.assertEqual([(n, v) for n, v, _rev in sharing],
+                         [("dup-a", "1.0.0"), ("dup-b", "1.0.0")])
+
+        inv = repository.inspect_all(self.db)
+        self.assertEqual(len(inv), 3)
+        statuses = [st for _r, _n, st, _a, _s in inv]
+        self.assertEqual(statuses.count("ok"), 3)
+
+        # 删除共享物理文件 -> 两个版本都 missing
+        os.unlink(pv_a.storage_path)
+        found = repository.inspect_version(self.db, "dup-b", "1.0.0")
+        self.assertEqual(found[2], catalog.STATUS_MISSING)
+        self.assertIsNone(found[3])
+
+        # 写坏 solo 的文件 -> corrupt，actual 与记录不同
+        with open(pv_solo.storage_path, "wb") as f:
+            f.write(b"corrupted-content")
+        found = repository.inspect_version(self.db, "solo", "1.0.0")
+        _r, _n, status, actual, _sharing = found
+        self.assertEqual(status, catalog.STATUS_CORRUPT)
+        self.assertIsNotNone(actual)
+        self.assertNotEqual(actual, pv_solo.sha256)
+
+        inv = repository.inspect_all(self.db)
+        summary = {}
+        for _r, _n, st, _a, _s in inv:
+            summary[st] = summary.get(st, 0) + 1
+        self.assertEqual(summary, {"missing": 2, "corrupt": 1})
+
+        # 未知版本
+        self.assertIsNone(repository.inspect_version(self.db, "ghost", "9.9.9"))
+
+    def test_inspect_includes_revoked_versions(self):
+        self.publish("rv", "1.0.0", "rv-bytes")
+        repository.revoke_version(self.db, plugin_name="rv", version="1.0.0",
+                                  reason="旧包也要能核验")
+        found = repository.inspect_version(self.db, "rv", "1.0.0")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[2], catalog.STATUS_OK)
+        inv = repository.inspect_all(self.db)
+        self.assertEqual(len(inv), 1)
+
+    def test_repair_missing_restores_all_sharing_versions_no_revision(self):
+        self.publish("dup-a", "1.0.0", "same-bytes")
+        self.publish("dup-b", "2.0.0", "same-bytes")
+        revisions_before = list(self.db.revisions)
+        pv_a = self._row("dup-a", "1.0.0")
+        os.unlink(pv_a.storage_path)
+        self.assertEqual(
+            repository.inspect_version(self.db, "dup-a", "1.0.0")[2],
+            catalog.STATUS_MISSING)
+
+        outcome = repository.repair_version_file(
+            self.db, plugin_name="dup-a", version="1.0.0",
+            src_path=self._repair_src("same-bytes"))
+        self.assertEqual(outcome.status, "repaired")
+        self.assertTrue(outcome.written)
+        self.assertEqual(outcome.previous_status, "missing")
+        # 共享摘要的两个版本一并恢复
+        self.assertEqual(outcome.affected_count, 2)
+        self.assertEqual([(n, v) for n, v, _r in outcome.affected_versions],
+                         [("dup-a", "1.0.0"), ("dup-b", "2.0.0")])
+        # 修复不产生目录修订、不改元数据
+        self.assertEqual(self.db.revisions, revisions_before)
+        for name, ver in (("dup-a", "1.0.0"), ("dup-b", "2.0.0")):
+            _r, _n, st, actual, _s = repository.inspect_version(self.db, name, ver)
+            self.assertEqual(st, catalog.STATUS_OK)
+            self.assertEqual(actual, self._row(name, ver).sha256)
+
+    def test_repair_corrupt_file_is_atomically_replaced(self):
+        self.publish("cr", "1.0.0", "orig-content")
+        pv = self._row("cr", "1.0.0")
+        with open(pv.storage_path, "wb") as f:
+            f.write(b"broken")
+        outcome = repository.repair_version_file(
+            self.db, plugin_name="cr", version="1.0.0",
+            src_path=self._repair_src("orig-content"))
+        self.assertEqual(outcome.status, "repaired")
+        self.assertEqual(outcome.previous_status, "corrupt")
+        with open(pv.storage_path, "rb") as f:
+            self.assertEqual(f.read(), b"orig-content")
+
+    def test_repair_intact_file_is_not_rewritten(self):
+        self.publish("ok", "1.0.0", "keep-me")
+        pv = self._row("ok", "1.0.0")
+        before = os.stat(pv.storage_path)
+        outcome = repository.repair_version_file(
+            self.db, plugin_name="ok", version="1.0.0",
+            src_path=self._repair_src("keep-me"))
+        self.assertEqual(outcome.status, "ok")
+        self.assertFalse(outcome.written)
+        self.assertEqual(outcome.affected_count, 0)
+        # 完好文件不改写：inode/mtime 保持
+        self.assertEqual(os.stat(pv.storage_path).st_ino, before.st_ino)
+
+    def test_repair_sha_mismatch_rejected_and_original_kept(self):
+        self.publish("mm", "1.0.0", "original")
+        pv = self._row("mm", "1.0.0")
+        os.unlink(pv.storage_path)  # 缺失状态
+        # 提交内容与记录摘要不符：拒绝，且不得落任何文件到目标路径
+        with self.assertRaises(catalog.PublishError):
+            repository.repair_version_file(
+                self.db, plugin_name="mm", version="1.0.0",
+                src_path=self._repair_src("different-content"))
+        self.assertFalse(os.path.exists(pv.storage_path))
+        self.assertEqual(
+            repository.inspect_version(self.db, "mm", "1.0.0")[2],
+            catalog.STATUS_MISSING)
+
+        # 损坏状态下同样拒绝，坏文件原样保留
+        with open(pv.storage_path, "wb") as f:
+            f.write(b"still-broken")
+        with self.assertRaises(catalog.PublishError):
+            repository.repair_version_file(
+                self.db, plugin_name="mm", version="1.0.0",
+                src_path=self._repair_src("different-content"))
+        with open(pv.storage_path, "rb") as f:
+            self.assertEqual(f.read(), b"still-broken")
+
+    def test_repair_unknown_version_rejected(self):
+        with self.assertRaises(catalog.PublishError):
+            repository.repair_version_file(
+                self.db, plugin_name="nope", version="1.0.0",
+                src_path=self._repair_src("x"))
+
+    def test_repair_concurrent_replacers_never_leave_partial_file(self):
+        # 多次并发/重复修复同一缺失摘要：最终文件必完好，且每次读到的
+        # 共享文件要么不存在要么完整，临时文件不得残留
+        self.publish("cc1", "1.0.0", "concurrent-content")
+        self.publish("cc2", "1.0.0", "concurrent-content")
+        pv = self._row("cc1", "1.0.0")
+        os.unlink(pv.storage_path)
+
+        import threading
+        errors = []
+
+        def replace():
+            try:
+                src = self._repair_src("concurrent-content")
+                repository.repair_version_file(
+                    self.db, plugin_name="cc1", version="1.0.0", src_path=src)
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=replace) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        _r, _n, status, actual, sharing = repository.inspect_version(
+            self.db, "cc2", "1.0.0")
+        self.assertEqual(status, catalog.STATUS_OK)
+        self.assertEqual(len(sharing), 2)
+        leftovers = [n for n in os.listdir(os.path.dirname(pv.storage_path))
+                     if n.startswith(".repair-")]
+        self.assertEqual(leftovers, [])
+
+    def test_publish_repairs_corrupt_existing_content_addressed_file(self):
+        # 同摘要发布时发现既存内容寻址文件已损坏 -> 用完整上传原子扶正
+        self.publish("first", "1.0.0", "shared-content")
+        pv = self._row("first", "1.0.0")
+        with open(pv.storage_path, "wb") as f:
+            f.write(b"corrupt")
+        # 另一插件发布相同内容（同摘要），不应引用坏文件
+        path2, sha2 = self._write_pkg("shared-content")
+        pv2, rev = repository.publish_version(
+            self.db,
+            metadata=Meta("second", "1.0.0", sha2),
+            src_path=path2, original_filename="second-1.0.0.bin",
+            package_dir=self.pkgdir)
+        self.assertEqual(pv2.storage_path, pv.storage_path)
+        self.assertEqual(
+            repository.inspect_version(self.db, "first", "1.0.0")[2],
+            catalog.STATUS_OK)
 
 
 if __name__ == "__main__":
